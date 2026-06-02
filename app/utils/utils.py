@@ -1,6 +1,8 @@
 import json
 import locale
 import os
+import re
+from functools import lru_cache
 from pathlib import Path
 import threading
 from typing import Any
@@ -204,6 +206,39 @@ def split_string_by_punctuations(s):
     return result
 
 
+def normalize_script_for_subtitle_matching(video_script: str) -> str:
+    """
+    清理字幕匹配前的脚本文本。
+
+    用户可能手动输入 Markdown 分隔符、标题强调或 `_` 这类格式符号。
+    这些字符通常不会出现在 TTS/Whisper 的识别结果里；如果继续参与
+    字幕逐行匹配，脚本行数量会大于真实字幕行数量，最终可能补出
+    `00:00:00,000 --> 00:00:00,000`，导致剪辑软件无法导入 SRT。
+    """
+    video_script = video_script or ""
+    underscore_count = video_script.count("_")
+    video_script = video_script.replace("_", "")
+    cleaned_lines = []
+    removed_separator_lines = 0
+    for line in video_script.splitlines():
+        line = line.strip()
+        # Markdown 分隔符或强调符号单独成行时不会被 TTS 朗读，必须从
+        # 脚本行里移除，避免字幕聚合卡在这类“不可发声”的目标行上。
+        if re.fullmatch(r"[-*_]{3,}", line):
+            removed_separator_lines += 1
+            continue
+        cleaned_lines.append(line)
+
+    normalized_script = "\n".join(cleaned_lines).strip()
+    if underscore_count or removed_separator_lines:
+        logger.debug(
+            "normalized script for subtitle matching, "
+            f"removed underscores: {underscore_count}, "
+            f"removed markdown separator lines: {removed_separator_lines}"
+        )
+    return normalized_script
+
+
 def md5(text):
     import hashlib
 
@@ -221,7 +256,10 @@ def get_system_locale():
         return "en"
 
 
+@lru_cache(maxsize=None)
 def load_locales(i18n_dir):
+    # WebUI 每次交互都会触发 Streamlit 重新执行脚本，语言文件运行期不会变化，
+    # 因此缓存解析结果，避免反复读取和解析所有 i18n JSON 文件。
     _locales = {}
     for root, dirs, files in os.walk(i18n_dir):
         for file in files:

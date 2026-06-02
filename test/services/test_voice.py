@@ -1,6 +1,6 @@
 import asyncio
+import base64
 import unittest
-import os
 import sys
 import tempfile
 import time
@@ -44,8 +44,30 @@ class TestVoiceService(unittest.TestCase):
     
     def tearDown(self):
         self.loop.close()
-    
+
+    def test_get_all_azure_voices(self):
+        voices = vs.get_all_azure_voices()
+        # 数据已从内联字符串迁移到 azure_voices.json，确保仍能完整加载
+        self.assertEqual(len(voices), 331)
+        # 结果应为 "Name-Gender" 格式且已排序
+        self.assertEqual(voices, sorted(voices))
+        for v in voices:
+            self.assertTrue(v.endswith("-Male") or v.endswith("-Female"))
+
+    def test_get_all_azure_voices_filtered(self):
+        filtered = vs.get_all_azure_voices(filter_locals=["zh-CN", "en-US"])
+        self.assertTrue(len(filtered) > 0)
+        self.assertTrue(
+            all(v.startswith(("zh-CN", "en-US")) for v in filtered)
+        )
+
     def test_siliconflow(self):
+        # SiliconFlow 的 API Key 存在 [siliconflow].api_key 中，运行时代码也是从
+        # config.siliconflow 读取；这里必须使用同一配置源，避免正确配置凭据时
+        # 测试仍然被误跳过。
+        if not vs.config.siliconflow.get("api_key"):
+            self.skipTest("siliconflow_api_key is not configured")
+
         voice_name = "siliconflow:FunAudioLLM/CosyVoice2-0.5B:alex-Male"
         voice_name = vs.parse_voice_name(voice_name)
         
@@ -192,6 +214,9 @@ class TestVoiceService(unittest.TestCase):
         self.assertLess(elapsed, 2)
 
     def test_azure_tts_v2(self):
+        if not vs.config.azure.get("speech_key") or not vs.config.azure.get("speech_region"):
+            self.skipTest("Azure speech key or region is not configured")
+
         voice_name = "zh-CN-XiaoxiaoMultilingualNeural-V2-Female"
         voice_name = vs.parse_voice_name(voice_name)
         print(voice_name)
@@ -277,6 +302,97 @@ class TestVoiceService(unittest.TestCase):
         subtitle_content = Path(subtitle_file).read_text(encoding="utf-8")
         self.assertIn("Gemini subtitle generation should work now", subtitle_content)
         self.assertIn("Testing multiple lines", subtitle_content)
+
+    def test_mimo_tts_uses_openai_compatible_audio_response(self):
+        """
+        验证 Xiaomi MiMo TTS 可以消费 OpenAI-compatible 的音频响应结构。
+
+        这里用 fake OpenAI client 和 fake AudioSegment 覆盖真实网络与 ffmpeg，
+        确认运行时代码会把待合成文本放到 assistant message，并把返回的
+        base64 WAV 音频导出到项目后续流程使用的音频文件。
+        """
+
+        class _FakeAudio:
+            def __init__(self):
+                self.data = base64.b64encode(b"RIFF-fake-wav").decode("utf-8")
+
+        class _FakeMessage:
+            def __init__(self):
+                self.audio = _FakeAudio()
+
+        class _FakeChoice:
+            def __init__(self):
+                self.message = _FakeMessage()
+
+        class _FakeCompletion:
+            def __init__(self):
+                self.choices = [_FakeChoice()]
+
+        class _FakeCompletions:
+            def create(self, **kwargs):
+                self.kwargs = kwargs
+                return _FakeCompletion()
+
+        class _FakeAudioSegment:
+            def __len__(self):
+                return 1800
+
+            def export(self, output_file, format):
+                Path(output_file).write_bytes(b"fake-mp3")
+
+        fake_completions = _FakeCompletions()
+        fake_client = SimpleNamespace(
+            chat=SimpleNamespace(completions=fake_completions)
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
+            vs,
+            "OpenAI",
+            return_value=fake_client,
+        ) as openai_client, patch(
+            "pydub.AudioSegment.from_file",
+            return_value=_FakeAudioSegment(),
+        ), patch.object(
+            vs.config,
+            "app",
+            dict(
+                vs.config.app,
+                mimo_api_key="mimo-key",
+                mimo_base_url="https://api.xiaomimimo.com/v1",
+                mimo_tts_model_name="mimo-v2.5-tts",
+                mimo_tts_style_prompt="用清晰的中文旁白朗读。",
+            ),
+        ):
+            voice_file = str(Path(tmp_dir) / "mimo-tts.mp3")
+            sub_maker = vs.mimo_tts(
+                text="小米语音合成测试。第二句话。",
+                voice_name="冰糖",
+                voice_rate=1.0,
+                voice_file=voice_file,
+                voice_volume=1.0,
+            )
+            generated_audio = Path(voice_file).read_bytes()
+
+        openai_client.assert_called_once_with(
+            api_key="mimo-key",
+            base_url="https://api.xiaomimimo.com/v1",
+        )
+        self.assertEqual(fake_completions.kwargs["model"], "mimo-v2.5-tts")
+        self.assertEqual(
+            fake_completions.kwargs["messages"],
+            [
+                {"role": "user", "content": "用清晰的中文旁白朗读。"},
+                {"role": "assistant", "content": "小米语音合成测试。第二句话。"},
+            ],
+        )
+        self.assertEqual(
+            fake_completions.kwargs["audio"],
+            {"format": "wav", "voice": "冰糖"},
+        )
+        self.assertEqual(generated_audio, b"fake-mp3")
+        self.assertIsNotNone(sub_maker)
+        self.assertEqual(getattr(sub_maker, "subs", []), ["小米语音合成测试", "第二句话"])
+        self.assertEqual(len(getattr(sub_maker, "offset", [])), 2)
 
     def test_generate_subtitle_keeps_edge_provider_for_gemini_legacy_submaker(self):
         """
@@ -368,6 +484,145 @@ class TestVoiceService(unittest.TestCase):
 
         self.assertEqual(len(sub_items), len(script_lines))
         self.assertIn("1,000 years", sub_items[-1])
+
+    def test_script_split_supports_arabic_punctuation(self):
+        """
+        阿拉伯语脚本常用 ، ؛ ؟ 作为自然断句标点。断句阶段必须识别这些
+        标点，否则 edge-tts cue 的停顿边界和脚本行边界会错位。
+        """
+        text = "مرحبا بالعالم، كيف حالك؟ هذا اختبار؛ يعمل بشكل جيد."
+
+        self.assertEqual(
+            utils.split_string_by_punctuations(text),
+            [
+                "مرحبا بالعالم",
+                "كيف حالك",
+                "هذا اختبار",
+                "يعمل بشكل جيد",
+            ],
+        )
+
+    def test_match_script_line_normalizes_arabic_letter_forms(self):
+        """
+        edge-tts 可能把阿拉伯语中的不同字母形态归一化，或返回带变音符号、
+        Tatweel 的 cue 文本。匹配时应容错，但最终字幕仍保留原始脚本文案。
+        """
+        script_lines = ["أهلاً وسهلاً بك في المدرسة"]
+
+        matched = vs._match_script_line(
+            script_lines,
+            "اهلا وسهلا بك في المدرسه",
+            0,
+        )
+
+        self.assertEqual(matched, script_lines[0])
+
+    def test_edge_cue_aggregation_handles_arabic_variant_forms(self):
+        """
+        复现阿拉伯语字幕失败的核心路径：脚本包含 أ/ة 等字母形态，edge cue
+        返回 ا/ه 等归一化形态时，聚合仍应生成完整字幕，避免回退 Whisper。
+        """
+        text = "أهلاً وسهلاً بك في المدرسة؟ هذا اختبار رائع، شكراً لك."
+        script_lines = utils.split_string_by_punctuations(text)
+        cue_texts = [
+            "اهلا وسهلا بك في المدرسه",
+            "هذا اختبار رائع",
+            "شكرا لك",
+        ]
+        sub_maker = SimpleNamespace(
+            cues=[
+                SimpleNamespace(
+                    content=cue_text,
+                    start=timedelta(seconds=index),
+                    end=timedelta(seconds=index + 0.8),
+                )
+                for index, cue_text in enumerate(cue_texts)
+            ]
+        )
+
+        sub_items = vs._build_subtitle_items_from_edge_cues(sub_maker, script_lines)
+
+        self.assertEqual(len(sub_items), len(script_lines))
+        self.assertIn("أهلاً وسهلاً بك في المدرسة", sub_items[0])
+        self.assertIn("شكراً لك", sub_items[-1])
+
+    def test_create_subtitle_ignores_markdown_separator_lines(self):
+        """
+        用户手动脚本可能包含 `---` 这类 Markdown 分隔符。TTS 不会朗读
+        这些符号行，字幕聚合也不应把它们当成目标字幕行，否则后续真实
+        字幕会卡住并回退到 Whisper。
+        """
+        text = "第一段\n---\n第二段"
+        sub_maker = SimpleNamespace(
+            cues=[
+                SimpleNamespace(
+                    content="第一段",
+                    start=timedelta(seconds=0),
+                    end=timedelta(seconds=0.8),
+                ),
+                SimpleNamespace(
+                    content="第二段",
+                    start=timedelta(seconds=1),
+                    end=timedelta(seconds=1.8),
+                ),
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "subtitle.srt"
+            vs.create_subtitle(
+                sub_maker=sub_maker,
+                text=text,
+                subtitle_file=str(subtitle_file),
+            )
+
+            subtitle_content = subtitle_file.read_text(encoding="utf-8")
+
+        self.assertIn("第一段", subtitle_content)
+        self.assertIn("第二段", subtitle_content)
+        self.assertNotIn("---", subtitle_content)
+        self.assertNotIn("00:00:00,000 --> 00:00:00,000", subtitle_content)
+
+    def test_create_subtitle_ignores_markdown_underscore_marks(self):
+        """
+        `_` 常被用户用作 Markdown 强调标记，但 TTS 返回的 cue 通常不包含
+        这些格式符。匹配时应忽略 `_`，避免生成空字幕或回退到 Whisper。
+        """
+        text = "这是_a_测试。"
+        sub_maker = SimpleNamespace(
+            cues=[
+                SimpleNamespace(
+                    content="这是a测试",
+                    start=timedelta(seconds=0),
+                    end=timedelta(seconds=0.8),
+                ),
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            subtitle_file = Path(tmp_dir) / "subtitle.srt"
+            vs.create_subtitle(
+                sub_maker=sub_maker,
+                text=text,
+                subtitle_file=str(subtitle_file),
+            )
+
+            subtitle_content = subtitle_file.read_text(encoding="utf-8")
+
+        self.assertIn("这是a测试", subtitle_content)
+        self.assertNotIn("这是_a_测试", subtitle_content)
+        self.assertNotIn("00:00:00,000 --> 00:00:00,000", subtitle_content)
+
+    def test_convert_rate_to_percent_signs_zero_rate(self):
+        # Rates near but not exactly 1.0 round to 0 percent. edge-tts rejects
+        # an unsigned "0%" (ValueError: Invalid rate '0%'), so the helper must
+        # emit a sign-prefixed "+0%". Regression test for that crash.
+        self.assertEqual(vs.convert_rate_to_percent(1.0), "+0%")
+        self.assertEqual(vs.convert_rate_to_percent(1.004), "+0%")
+        self.assertEqual(vs.convert_rate_to_percent(0.997), "+0%")
+        self.assertEqual(vs.convert_rate_to_percent(1.5), "+50%")
+        self.assertEqual(vs.convert_rate_to_percent(0.8), "-20%")
+
 
 if __name__ == "__main__":
     # python -m unittest test.services.test_voice.TestVoiceService.test_azure_tts_v1
